@@ -24,7 +24,7 @@ class Command(BaseCommand):
         
         if options.get('interactive', True):
             print
-            print "WARNING: This will irreparably remove EVERYTHING from your search index in connection '%s'." % DEFAULT_ALIAS
+            print "WARNING: This will irreparably remove EVERYTHING from your search index in connection '%s'." % self.using
             print "Your choices after this are to restore from backups or rebuild via the `rebuild_index` command."
             
             yes_or_no = raw_input("Are you sure you wish to continue? [y/N] ")
