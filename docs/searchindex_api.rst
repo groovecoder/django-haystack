@@ -566,10 +566,9 @@ The ``ModelSearchIndex`` class allows for automatic generation of a
 With the exception of the automated introspection, it is a ``SearchIndex``
 class, so all notes above pertaining to ``SearchIndexes`` apply. As with the
 ``ModelForm`` class in Django, it employs an inner class called ``Meta``,
-which should either contain a ``pass`` to include all fields, a ``fields`` list
-to specify a whitelisted set of fields or ``excludes`` to prevent certain fields
-from appearing in the class. Unlike ``ModelForm``, you should **NOT** specify
-a ``model`` attribute, as that is already handled when registering the class.
+which should define the model and either contain a ``pass`` to include all fields,
+a ``fields`` list to specify a whitelisted set of fields or ``excludes``
+to prevent certain fields from appearing in the class.
 
 In addition, it adds a `text` field that is the ``document=True`` field and
 has `use_template=True` option set, just like the ``BasicSearchIndex``.
@@ -594,16 +593,19 @@ For the impatient::
     # All Fields
     class AllNoteIndex(indexes.ModelSearchIndex):
         class Meta:
+            model Note
             pass
     
     # Blacklisted Fields
     class LimitedNoteIndex(indexes.ModelSearchIndex):
         class Meta:
+            model Note
             excludes = ['user']
     
     # Whitelisted Fields
     class NoteIndex(indexes.ModelSearchIndex):
         class Meta:
+            model Note
             fields = ['user', 'pub_date']
         
         # Note that regular ``SearchIndex`` methods apply.
