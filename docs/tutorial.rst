@@ -80,6 +80,8 @@ the following:
 Solr
 ~~~~
 
+Example::
+
     HAYSTACK_CONNECTIONS = {
         'default': {
             'ENGINE': 'haystack.backends.solr_backend.SolrEngine',
@@ -179,7 +181,7 @@ it applies to, though that is not required. This allows
     from myapp.models import Note
     
     
-    class NoteIndex(indexes.SearchIndex):
+    class NoteIndex(indexes.SearchIndex, indexes.Indexable):
         text = indexes.CharField(document=True, use_template=True)
         author = indexes.CharField(model_attr='user')
         pub_date = indexes.DateTimeField(model_attr='pub_date')

@@ -1,4 +1,5 @@
 from datetime import timedelta
+from decimal import Decimal
 import os
 import shutil
 from whoosh.fields import TEXT, KEYWORD, NUMERIC, DATETIME, BOOLEAN
@@ -15,7 +16,7 @@ from core.models import MockModel, AnotherMockModel, AFourthMockModel
 from core.tests.mocks import MockSearchResult
 
 
-class WhooshMockSearchIndex(indexes.SearchIndex):
+class WhooshMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, use_template=True)
     name = indexes.CharField(model_attr='author')
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -24,7 +25,7 @@ class WhooshMockSearchIndex(indexes.SearchIndex):
         return MockModel
 
 
-class WhooshAnotherMockSearchIndex(indexes.SearchIndex):
+class WhooshAnotherMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True)
     name = indexes.CharField(model_attr='author')
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -36,7 +37,7 @@ class WhooshAnotherMockSearchIndex(indexes.SearchIndex):
         return obj.author
 
 
-class AllTypesWhooshMockSearchIndex(indexes.SearchIndex):
+class AllTypesWhooshMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, use_template=True)
     name = indexes.CharField(model_attr='author', indexed=False)
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -48,7 +49,7 @@ class AllTypesWhooshMockSearchIndex(indexes.SearchIndex):
         return MockModel
 
 
-class WhooshMaintainTypeMockSearchIndex(indexes.SearchIndex):
+class WhooshMaintainTypeMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True)
     month = indexes.CharField(indexed=False)
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -63,7 +64,7 @@ class WhooshMaintainTypeMockSearchIndex(indexes.SearchIndex):
         return "%02d" % obj.pub_date.month
 
 
-class WhooshBoostMockSearchIndex(indexes.SearchIndex):
+class WhooshBoostMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(
         document=True, use_template=True,
         template_name='search/indexes/core/mockmodel_template.txt'
@@ -74,9 +75,17 @@ class WhooshBoostMockSearchIndex(indexes.SearchIndex):
     
     def get_model(self):
         return AFourthMockModel
+    
+    def prepare(self, obj):
+        data = super(WhooshBoostMockSearchIndex, self).prepare(obj)
+
+        if obj.pk % 2 == 0:
+            data['boost'] = 2.0
+
+        return data
 
 
-class WhooshAutocompleteMockModelSearchIndex(indexes.SearchIndex):
+class WhooshAutocompleteMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(model_attr='foo', document=True)
     name = indexes.CharField(model_attr='author')
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -125,6 +134,35 @@ class WhooshSearchBackendTestCase(TestCase):
         self.raw_whoosh = self.raw_whoosh.refresh()
         searcher = self.raw_whoosh.searcher()
         return searcher.search(self.parser.parse(query), limit=1000)
+    
+    def test_non_silent(self):
+        bad_sb = connections['default'].backend('bad', PATH='/tmp/bad_whoosh', SILENTLY_FAIL=False)
+        bad_sb.use_file_storage = False
+        bad_sb.storage = 'omg.wtf.bbq'
+
+        try:
+            bad_sb.update(self.wmmi, self.sample_objs)
+            self.fail()
+        except:
+            pass
+
+        try:
+            bad_sb.remove('core.mockmodel.1')
+            self.fail()
+        except:
+            pass
+        
+        try:
+            bad_sb.clear()
+            self.fail()
+        except:
+            pass
+        
+        try:
+            bad_sb.search('foo')
+            self.fail()
+        except:
+            pass
     
     def test_update(self):
         self.sb.update(self.wmmi, self.sample_objs)
@@ -244,12 +282,12 @@ class WhooshSearchBackendTestCase(TestCase):
         self.sb.update(self.wmmi, self.sample_objs)
         self.assertEqual(len(self.whoosh_search(u'*')), 23)
         
-        # Unsupported by Whoosh. Should see empty results.
-        self.assertEqual(self.sb.more_like_this(self.sample_objs[0])['hits'], 0)
+        # Now supported by Whoosh (as of 1.8.4). See the ``LiveWhooshMoreLikeThisTestCase``.
+        self.assertEqual(self.sb.more_like_this(self.sample_objs[0])['hits'], 22)
         
         # Make sure that swapping the ``result_class`` doesn't blow up.
         try:
-            self.sb.search(u'index document', result_class=MockSearchResult)
+            self.sb.more_like_this(self.sample_objs[0], result_class=MockSearchResult)
         except:
             self.fail()
     
@@ -446,6 +484,7 @@ class WhooshBoostBackendTestCase(TestCase):
             'core.afourthmockmodel.2',
             'core.afourthmockmodel.4'
         ])
+        self.assertEqual(results[0].boost, 1.1)
 
 
 class LiveWhooshSearchQueryTestCase(TestCase):
@@ -742,8 +781,6 @@ class LiveWhooshMultiSearchQuerySetTestCase(TestCase):
         # Stow.
         temp_path = os.path.join('tmp', 'test_whoosh_query')
         self.old_whoosh_path = settings.HAYSTACK_CONNECTIONS['default']['PATH']
-        settings.HAYSTACK_CONNECTIONS['default']['PATH'] = temp_path
-        
         self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.wmmi = WhooshMockSearchIndex()
@@ -782,6 +819,72 @@ class LiveWhooshMultiSearchQuerySetTestCase(TestCase):
         sqs = self.sqs.models(AnotherMockModel)
         self.assertEqual(sqs.query.build_query(), u'django_ct:core.anothermockmodel')
         self.assertEqual(len(sqs), 2)
+
+
+class LiveWhooshMoreLikeThisTestCase(TestCase):
+    fixtures = ['bulk_data.json']
+    
+    def setUp(self):
+        super(LiveWhooshMoreLikeThisTestCase, self).setUp()
+        
+        # Stow.
+        temp_path = os.path.join('tmp', 'test_whoosh_query')
+        self.old_whoosh_path = settings.HAYSTACK_CONNECTIONS['default']['PATH']
+        settings.HAYSTACK_CONNECTIONS['default']['PATH'] = temp_path
+        
+        self.old_ui = connections['default'].get_unified_index()
+        self.ui = UnifiedIndex()
+        self.wmmi = WhooshMockSearchIndex()
+        self.wamsi = WhooshAnotherMockSearchIndex()
+        self.ui.build(indexes=[self.wmmi, self.wamsi])
+        self.sb = connections['default'].get_backend()
+        connections['default']._index = self.ui
+        
+        self.sb.setup()
+        self.raw_whoosh = self.sb.index
+        self.parser = QueryParser(self.sb.content_field_name, schema=self.sb.schema)
+        self.sb.delete_index()
+        
+        self.wmmi.update()
+        self.wamsi.update()
+        
+        self.sqs = SearchQuerySet()
+    
+    def tearDown(self):
+        if os.path.exists(settings.HAYSTACK_CONNECTIONS['default']['PATH']):
+            shutil.rmtree(settings.HAYSTACK_CONNECTIONS['default']['PATH'])
+        
+        settings.HAYSTACK_CONNECTIONS['default']['PATH'] = self.old_whoosh_path
+        connections['default']._index = self.old_ui
+        super(LiveWhooshMoreLikeThisTestCase, self).tearDown()
+    
+    def test_more_like_this(self):
+        mlt = self.sqs.more_like_this(MockModel.objects.get(pk=22))
+        self.assertEqual(mlt.count(), 22)
+        self.assertEqual(sorted([result.pk for result in mlt]), sorted([u'9', u'8', u'7', u'6', u'5', u'4', u'3', u'2', u'1', u'21', u'20', u'19', u'18', u'17', u'16', u'15', u'14', u'13', u'12', u'11', u'10', u'23']))
+        self.assertEqual(len([result.pk for result in mlt]), 22)
+        
+        alt_mlt = self.sqs.filter(name='daniel3').more_like_this(MockModel.objects.get(pk=13))
+        self.assertEqual(alt_mlt.count(), 8)
+        self.assertEqual(sorted([result.pk for result in alt_mlt]), sorted([u'4', u'3', u'22', u'19', u'17', u'16', u'10', u'23']))
+        self.assertEqual(len([result.pk for result in alt_mlt]), 8)
+        
+        alt_mlt_with_models = self.sqs.models(MockModel).more_like_this(MockModel.objects.get(pk=11))
+        self.assertEqual(alt_mlt_with_models.count(), 22)
+        self.assertEqual(sorted([result.pk for result in alt_mlt_with_models]), sorted([u'9', u'8', u'7', u'6', u'5', u'4', u'3', u'2', u'1', u'22', u'21', u'20', u'19', u'18', u'17', u'16', u'15', u'14', u'13', u'12', u'10', u'23']))
+        self.assertEqual(len([result.pk for result in alt_mlt_with_models]), 22)
+        
+        if hasattr(MockModel.objects, 'defer'):
+            # Make sure MLT works with deferred bits.
+            mi = MockModel.objects.defer('foo').get(pk=21)
+            self.assertEqual(mi._deferred, True)
+            deferred = self.sqs.models(MockModel).more_like_this(mi)
+            self.assertEqual(deferred.count(), 0)
+            self.assertEqual([result.pk for result in deferred], [])
+            self.assertEqual(len([result.pk for result in deferred]), 0)
+        
+        # Ensure that swapping the ``result_class`` works.
+        self.assertTrue(isinstance(self.sqs.result_class(MockSearchResult).more_like_this(MockModel.objects.get(pk=21))[0], MockSearchResult))
 
 
 class LiveWhooshAutocompleteTestCase(TestCase):
@@ -837,12 +940,13 @@ class LiveWhooshAutocompleteTestCase(TestCase):
         self.assertEqual(len([result.pk for result in autocomplete]), 5)
 
 
-class WhooshRoundTripSearchIndex(indexes.SearchIndex):
+class WhooshRoundTripSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, default='')
     name = indexes.CharField()
     is_active = indexes.BooleanField()
     post_count = indexes.IntegerField()
     average_rating = indexes.FloatField()
+    price = indexes.DecimalField()
     pub_date = indexes.DateField()
     created = indexes.DateTimeField()
     tags = indexes.MultiValueField()
@@ -861,6 +965,7 @@ class WhooshRoundTripSearchIndex(indexes.SearchIndex):
             'is_active': True,
             'post_count': 25,
             'average_rating': 3.6,
+            'price': Decimal('24.99'),
             'pub_date': date(2009, 11, 21),
             'created': datetime(2009, 11, 21, 21, 31, 00),
             'tags': ['staff', 'outdoor', 'activist', 'scientist'],
@@ -926,6 +1031,7 @@ class LiveWhooshRoundTripTestCase(TestCase):
         self.assertEqual(result.is_active, True)
         self.assertEqual(result.post_count, 25)
         self.assertEqual(result.average_rating, 3.6)
+        self.assertEqual(result.price, u'24.99')
         self.assertEqual(result.pub_date, datetime(2009, 11, 21, 0, 0))
         self.assertEqual(result.created, datetime(2009, 11, 21, 21, 31, 00))
         self.assertEqual(result.tags, ['staff', 'outdoor', 'activist', 'scientist'])

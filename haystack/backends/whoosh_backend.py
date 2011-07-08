@@ -8,7 +8,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
 from django.utils.datetime_safe import datetime
 from django.utils.encoding import force_unicode
-from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query
+from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query, EmptyResults
 from haystack.constants import ID, DJANGO_CT, DJANGO_ID
 from haystack.exceptions import MissingDependency, SearchBackendError
 from haystack.models import SearchResult
@@ -20,6 +20,11 @@ except ImportError:
         import simplejson as json
     except ImportError:
         from django.utils import simplejson as json
+try:
+    from django.db.models.sql.query import get_proxied_model
+except ImportError:
+    # Likely on Django 1.0
+    get_proxied_model = None
 
 try:
     import whoosh
@@ -38,8 +43,8 @@ from whoosh.spelling import SpellChecker
 from whoosh.writing import AsyncWriter
 
 # Handle minimum requirement.
-if not hasattr(whoosh, '__version__') or whoosh.__version__ < (1, 8, 1):
-    raise MissingDependency("The 'whoosh' backend requires version 1.8.1 or greater.")
+if not hasattr(whoosh, '__version__') or whoosh.__version__ < (1, 8, 4):
+    raise MissingDependency("The 'whoosh' backend requires version 1.8.4 or greater.")
 
 
 DATETIME_REGEX = re.compile('^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(\.\d{3,6}Z?)?$')
@@ -172,7 +177,13 @@ class WhooshSearchBackend(BaseSearchBackend):
             for key in doc:
                 doc[key] = self._from_python(doc[key])
             
-            writer.update_document(**doc)
+            try:
+                writer.update_document(**doc)
+            except Exception, e:
+                if not self.silently_fail:
+                    raise
+                
+                self.log.error("Failed to add documents to Whoosh: %s", e)
         
         if len(iterable) > 0:
             # For now, commit no matter what, as we run into locking issues otherwise.
@@ -189,7 +200,14 @@ class WhooshSearchBackend(BaseSearchBackend):
         
         self.index = self.index.refresh()
         whoosh_id = get_identifier(obj_or_string)
-        self.index.delete_by_query(q=self.parser.parse(u'%s:"%s"' % (ID, whoosh_id)))
+        
+        try:
+            self.index.delete_by_query(q=self.parser.parse(u'%s:"%s"' % (ID, whoosh_id)))
+        except Exception, e:
+            if not self.silently_fail:
+                raise
+            
+            self.log.error("Failed to remove document '%s' from Whoosh: %s", whoosh_id, e)
     
     def clear(self, models=[], commit=True):
         if not self.setup_complete:
@@ -197,15 +215,21 @@ class WhooshSearchBackend(BaseSearchBackend):
         
         self.index = self.index.refresh()
         
-        if not models:
-            self.delete_index()
-        else:
-            models_to_delete = []
+        try:
+            if not models:
+                self.delete_index()
+            else:
+                models_to_delete = []
+                
+                for model in models:
+                    models_to_delete.append(u"%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
+                
+                self.index.delete_by_query(q=self.parser.parse(u" OR ".join(models_to_delete)))
+        except Exception, e:
+            if not self.silently_fail:
+                raise
             
-            for model in models:
-                models_to_delete.append(u"%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
-            
-            self.index.delete_by_query(q=self.parser.parse(u" OR ".join(models_to_delete)))
+            self.log.error("Failed to remove document '%s' from Whoosh: %s", whoosh_id, e)
     
     def delete_index(self):
         # Per the Whoosh mailing list, if wiping out everything from the index,
@@ -364,6 +388,9 @@ class WhooshSearchBackend(BaseSearchBackend):
             try:
                 raw_page = ResultsPage(raw_results, page_num, page_length)
             except ValueError:
+                if not self.silently_fail:
+                    raise
+                
                 return {
                     'results': [],
                     'hits': 0,
@@ -395,11 +422,108 @@ class WhooshSearchBackend(BaseSearchBackend):
     def more_like_this(self, model_instance, additional_query_string=None,
                        start_offset=0, end_offset=None,
                        limit_to_registered_models=None, result_class=None, **kwargs):
-        warnings.warn("Whoosh does not handle More Like This.", Warning, stacklevel=2)
-        return {
-            'results': [],
-            'hits': 0,
-        }
+        if not self.setup_complete:
+            self.setup()
+        
+        # Handle deferred models.
+        if get_proxied_model and hasattr(model_instance, '_deferred') and model_instance._deferred:
+            model_klass = get_proxied_model(model_instance._meta)
+        else:
+            model_klass = type(model_instance)
+        
+        field_name = self.content_field_name
+        narrow_queries = set()
+        narrowed_results = None
+        self.index = self.index.refresh()
+        
+        if limit_to_registered_models is None:
+            limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
+        
+        if limit_to_registered_models:
+            # Using narrow queries, limit the results to only models registered
+            # with the current site.
+            if narrow_queries is None:
+                narrow_queries = set()
+            
+            registered_models = self.build_models_list()
+            
+            if len(registered_models) > 0:
+                narrow_queries.add(' OR '.join(['%s:%s' % (DJANGO_CT, rm) for rm in registered_models]))
+        
+        if additional_query_string and additional_query_string != '*':
+            narrow_queries.add(additional_query_string)
+        
+        narrow_searcher = None
+        
+        if narrow_queries is not None:
+            # Potentially expensive? I don't see another way to do it in Whoosh...
+            narrow_searcher = self.index.searcher()
+            
+            for nq in narrow_queries:
+                recent_narrowed_results = narrow_searcher.search(self.parser.parse(force_unicode(nq)))
+                
+                if narrowed_results:
+                    narrowed_results.filter(recent_narrowed_results)
+                else:
+                   narrowed_results = recent_narrowed_results
+        
+        # Prevent against Whoosh throwing an error. Requires an end_offset
+        # greater than 0.
+        if not end_offset is None and end_offset <= 0:
+            end_offset = 1
+        
+        # Determine the page.
+        page_num = 0
+        
+        if end_offset is None:
+            end_offset = 1000000
+        
+        if start_offset is None:
+            start_offset = 0
+        
+        page_length = end_offset - start_offset
+        
+        if page_length and page_length > 0:
+            page_num = start_offset / page_length
+        
+        # Increment because Whoosh uses 1-based page numbers.
+        page_num += 1
+        
+        self.index = self.index.refresh()
+        raw_results = EmptyResults()
+        
+        if self.index.doc_count():
+            query = "%s:%s" % (ID, get_identifier(model_instance))
+            searcher = self.index.searcher()
+            parsed_query = self.parser.parse(query)
+            results = searcher.search(parsed_query)
+            
+            if len(results):
+                raw_results = results[0].more_like_this(field_name, top=end_offset)
+            
+            # Handle the case where the results have been narrowed.
+            if narrowed_results and hasattr(raw_results, 'filter'):
+                raw_results.filter(narrowed_results)
+        
+        try:
+            raw_page = ResultsPage(raw_results, page_num, page_length)
+        except ValueError:
+            if not self.silently_fail:
+                raise
+            
+            return {
+                'results': [],
+                'hits': 0,
+                'spelling_suggestion': None,
+            }
+        
+        results = self._process_results(raw_page, result_class=result_class)
+        searcher.close()
+        
+        if hasattr(narrow_searcher, 'close'):
+            narrow_searcher.close()
+        
+        return results
     
     def _process_results(self, raw_page, highlight=False, query_string='', spelling_query=None, result_class=None):
         from haystack import connections

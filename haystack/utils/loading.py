@@ -82,18 +82,25 @@ class ConnectionHandler(object):
         self._connections = {}
         self._index = None
     
+    def ensure_defaults(self, alias):
+        try:
+            conn = self.connections_info[alias]
+        except KeyError:
+            raise ImproperlyConfigured("The key '%s' isn't an available connection." % alias)
+
+        if not conn.get('ENGINE'):
+            conn['ENGINE'] = 'haystack.backends.simple_backend.SimpleEngine'
+
     def __getitem__(self, key):
         if key in self._connections:
             return self._connections[key]
         
-        if not key in self.connections_info:
-            raise ImproperlyConfigured("The key '%s' isn't an available connection." % key)
-        
+        self.ensure_defaults(key)
         self._connections[key] = load_backend(self.connections_info[key]['ENGINE'])(using=key)
         return self._connections[key]
     
     def all(self):
-        return [self[alias] for alias in self._connections]
+        return [self[alias] for alias in self.connections_info]
 
 
 class ConnectionRouter(object):
@@ -133,14 +140,13 @@ class UnifiedIndex(object):
         self.indexes = {}
         self.fields = SortedDict()
         self._built = False
+        self._indexes_setup = False
         self.excluded_indexes = getattr(settings, 'HAYSTACK_EXCLUDED_INDEXES', [])
         self.document_field = getattr(settings, 'HAYSTACK_DOCUMENT_FIELD', 'text')
         self._fieldnames = {}
         self._facet_fieldnames = {}
     
     def collect_indexes(self):
-        from haystack.indexes import SearchIndex, BasicSearchIndex, ModelSearchIndex
-        base_classes = [Indexable, SearchIndex, BasicSearchIndex, ModelSearchIndex]
         indexes = []
         
         for app in settings.INSTALLED_APPS:
@@ -150,7 +156,7 @@ class UnifiedIndex(object):
                 continue
             
             for item_name, item in inspect.getmembers(search_index_module, inspect.isclass):
-                if not item in base_classes and issubclass(item, Indexable):
+                if getattr(item, 'haystack_use_for_indexing', False):
                     # We've got an index. Check if we should be ignoring it.
                     class_path = "%s.search_indexes.%s" % (app, item_name)
                     
@@ -244,10 +250,15 @@ class UnifiedIndex(object):
     def setup_indexes(self):
         if not self._built:
             self.build()
-        
+
+        if self._indexes_setup:
+            return
+
         for model_ct, index in self.indexes.items():
             index._setup_save()
             index._setup_delete()
+
+        self._indexes_setup = True
     
     def teardown_indexes(self):
         if not self._built:
@@ -256,6 +267,8 @@ class UnifiedIndex(object):
         for model_ct, index in self.indexes.items():
             index._teardown_save()
             index._teardown_delete()
+
+        self._indexes_setup = False
     
     def get_indexed_models(self):
         if not self._built:

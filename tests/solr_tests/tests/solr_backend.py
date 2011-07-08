@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import datetime
+from decimal import Decimal
 import logging
 import pysolr
 from django.conf import settings
@@ -30,7 +31,7 @@ def clear_solr_index():
     raw_solr.delete(q='*:*')
 
 
-class SolrMockSearchIndex(indexes.SearchIndex):
+class SolrMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, use_template=True)
     name = indexes.CharField(model_attr='author', faceted=True)
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -39,7 +40,7 @@ class SolrMockSearchIndex(indexes.SearchIndex):
         return MockModel
 
 
-class SolrMaintainTypeMockSearchIndex(indexes.SearchIndex):
+class SolrMaintainTypeMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, use_template=True)
     month = indexes.CharField(indexed=False)
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -51,7 +52,7 @@ class SolrMaintainTypeMockSearchIndex(indexes.SearchIndex):
         return MockModel
 
 
-class SolrMockModelSearchIndex(indexes.SearchIndex):
+class SolrMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(model_attr='foo', document=True)
     name = indexes.CharField(model_attr='author')
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -60,7 +61,7 @@ class SolrMockModelSearchIndex(indexes.SearchIndex):
         return MockModel
 
 
-class SolrAnotherMockModelSearchIndex(indexes.SearchIndex):
+class SolrAnotherMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True)
     name = indexes.CharField(model_attr='author')
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -72,7 +73,7 @@ class SolrAnotherMockModelSearchIndex(indexes.SearchIndex):
         return u"You might be searching for the user %s" % obj.author
 
 
-class SolrBoostMockSearchIndex(indexes.SearchIndex):
+class SolrBoostMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(
         document=True, use_template=True,
         template_name='search/indexes/core/mockmodel_template.txt'
@@ -85,12 +86,13 @@ class SolrBoostMockSearchIndex(indexes.SearchIndex):
         return AFourthMockModel
 
 
-class SolrRoundTripSearchIndex(indexes.SearchIndex):
+class SolrRoundTripSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, default='')
     name = indexes.CharField()
     is_active = indexes.BooleanField()
     post_count = indexes.IntegerField()
     average_rating = indexes.FloatField()
+    price = indexes.DecimalField()
     pub_date = indexes.DateField()
     created = indexes.DateTimeField()
     tags = indexes.MultiValueField()
@@ -107,6 +109,7 @@ class SolrRoundTripSearchIndex(indexes.SearchIndex):
             'is_active': True,
             'post_count': 25,
             'average_rating': 3.6,
+            'price': Decimal('24.99'),
             'pub_date': datetime.date(2009, 11, 21),
             'created': datetime.datetime(2009, 11, 21, 21, 31, 00),
             'tags': ['staff', 'outdoor', 'activist', 'scientist'],
@@ -115,7 +118,7 @@ class SolrRoundTripSearchIndex(indexes.SearchIndex):
         return prepped
 
 
-class SolrComplexFacetsMockSearchIndex(indexes.SearchIndex):
+class SolrComplexFacetsMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, default='')
     name = indexes.CharField(faceted=True)
     is_active = indexes.BooleanField(faceted=True)
@@ -130,7 +133,7 @@ class SolrComplexFacetsMockSearchIndex(indexes.SearchIndex):
         return MockModel
 
 
-class SolrAutocompleteMockModelSearchIndex(indexes.SearchIndex):
+class SolrAutocompleteMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(model_attr='foo', document=True)
     name = indexes.CharField(model_attr='author')
     pub_date = indexes.DateField(model_attr='pub_date')
@@ -170,6 +173,33 @@ class SolrSearchBackendTestCase(TestCase):
     def tearDown(self):
         connections['default']._index = self.old_ui
         super(SolrSearchBackendTestCase, self).tearDown()
+
+    def test_non_silent(self):
+        bad_sb = connections['default'].backend('bad', URL='http://omg.wtf.bbq:1000/solr', SILENTLY_FAIL=False)
+        
+        try:
+            bad_sb.update(self.smmi, self.sample_objs)
+            self.fail()
+        except:
+            pass
+
+        try:
+            bad_sb.remove('core.mockmodel.1')
+            self.fail()
+        except:
+            pass
+        
+        try:
+            bad_sb.clear()
+            self.fail()
+        except:
+            pass
+        
+        try:
+            bad_sb.search('foo')
+            self.fail()
+        except:
+            pass
     
     def test_update(self):
         self.sb.update(self.smmi, self.sample_objs)
@@ -1082,6 +1112,7 @@ class LiveSolrRoundTripTestCase(TestCase):
         self.assertEqual(result.is_active, True)
         self.assertEqual(result.post_count, 25)
         self.assertEqual(result.average_rating, 3.6)
+        self.assertEqual(result.price, u'24.99')
         self.assertEqual(result.pub_date, datetime.date(2009, 11, 21))
         self.assertEqual(result.created, datetime.datetime(2009, 11, 21, 21, 31, 00))
         self.assertEqual(result.tags, ['staff', 'outdoor', 'activist', 'scientist'])
